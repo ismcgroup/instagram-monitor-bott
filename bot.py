@@ -1,7 +1,6 @@
 import os
 import sqlite3
-import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 from telegram import Update
@@ -14,8 +13,11 @@ from telegram.ext import (
 TOKEN = os.getenv("BOT_TOKEN")
 DB_FILE = "accounts.db"
 
-# Instagram kontrol aralığı: 5 dakika
+# Check every 5 minutes
 CHECK_INTERVAL = 300
+
+# Turkey time (UTC+3)
+TURKEY_TZ = timezone(timedelta(hours=3))
 
 
 def init_db():
@@ -36,14 +38,44 @@ def init_db():
     conn.close()
 
 
-def check_instagram(username):
-    """
-    Instagram profilinin erişilebilir olup olmadığını kontrol eder.
-    Bu yöntem kesin bir hesap durumu garantisi vermez;
-    Instagram erişim kısıtlamaları ve rate limit nedeniyle
-    yanlış sonuç verebilir.
-    """
+def format_turkey_time(iso_time):
+    dt = datetime.fromisoformat(iso_time)
 
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    dt = dt.astimezone(TURKEY_TZ)
+
+    return dt.strftime("%B %d, %Y at %I:%M %p").replace(" 0", " ")
+
+
+def format_duration(seconds):
+    seconds = int(seconds)
+
+    days = seconds // 86400
+    hours = (seconds % 86400) // 3600
+    minutes = (seconds % 3600) // 60
+
+    parts = []
+
+    if days:
+        parts.append(f"{days} day" if days == 1 else f"{days} days")
+
+    if hours:
+        parts.append(f"{hours} hour" if hours == 1 else f"{hours} hours")
+
+    if minutes:
+        parts.append(
+            f"{minutes} minute" if minutes == 1 else f"{minutes} minutes"
+        )
+
+    if not parts:
+        return "Less than 1 minute"
+
+    return ", ".join(parts)
+
+
+def check_instagram(username):
     clean_username = username.replace("@", "")
 
     url = f"https://www.instagram.com/{clean_username}/"
@@ -78,11 +110,13 @@ def check_instagram(username):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 Bot is active!\n\n"
-        "Add an account:\n"
+        "🤖 ISMC Bot is active!\n\n"
+        "Start monitoring:\n"
         "/add @username\n\n"
-        "Check an account:\n"
-        "/status @username"
+        "Check status:\n"
+        "/status @username\n\n"
+        "Stop monitoring:\n"
+        "/stop @username"
     )
 
 
@@ -124,7 +158,8 @@ async def add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👻 Username: {username}\n"
         f"⏳ Status: Monitoring\n"
-        f"🕐 Monitoring started: {started_at}"
+        f"🕐 Monitoring started: "
+        f"{format_turkey_time(started_at)}"
     )
 
 
@@ -161,19 +196,62 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    last_checked = (
+        format_turkey_time(account[3])
+        if account[3]
+        else "Not checked yet"
+    )
+
     await update.message.reply_text(
         f"👻 Username: {account[0]}\n"
         f"⏳ Status: {account[2]}\n"
-        f"🕐 Started: {account[1]}\n"
-        f"🔍 Last checked: {account[3] or 'Not checked yet'}"
+        f"🕐 Monitoring started: "
+        f"{format_turkey_time(account[1])}\n"
+        f"🔍 Last checked: {last_checked}"
     )
 
 
-async def monitor_accounts(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Tüm kayıtlı hesapları kontrol eder.
-    """
+async def stop_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /stop @username"
+        )
+        return
 
+    username = context.args[0].lower()
+
+    if not username.startswith("@"):
+        username = "@" + username
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        UPDATE accounts
+        SET status = 'stopped'
+        WHERE username = ?
+        """,
+        (username,)
+    )
+
+    conn.commit()
+
+    updated = cursor.rowcount
+
+    conn.close()
+
+    if updated:
+        await update.message.reply_text(
+            f"🛑 Monitoring stopped for {username}."
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ No monitoring record found for {username}."
+        )
+
+
+async def monitor_accounts(context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
 
@@ -181,6 +259,7 @@ async def monitor_accounts(context: ContextTypes.DEFAULT_TYPE):
         """
         SELECT username, started_at, status, notified
         FROM accounts
+        WHERE status = 'monitoring'
         """
     )
 
@@ -188,12 +267,10 @@ async def monitor_accounts(context: ContextTypes.DEFAULT_TYPE):
 
     for username, started_at, current_status, notified in accounts:
 
-        if current_status != "monitoring":
-            continue
-
         result = check_instagram(username)
 
-        now = datetime.now(timezone.utc).isoformat()
+        now_utc = datetime.now(timezone.utc)
+        now_iso = now_utc.isoformat()
 
         cursor.execute(
             """
@@ -201,67 +278,61 @@ async def monitor_accounts(context: ContextTypes.DEFAULT_TYPE):
             SET last_checked = ?
             WHERE username = ?
             """,
-            (now, username)
+            (now_iso, username)
         )
 
         conn.commit()
 
-        # Instagram hâlâ erişilebilir
-        if result == "active":
-            continue
-
-        # Sonuç kesin değilse bildirim gönderme
+        # Do nothing if Instagram returns an uncertain result
         if result == "unknown":
             continue
 
-        # Hesap erişilemez hale geldiyse
-        if result == "unavailable" and notified == 0:
+        # Wait until the account becomes active
+        if result != "active":
+            continue
 
-            start_time = datetime.fromisoformat(started_at)
+        # Do not send the notification more than once
+        if notified == 1:
+            continue
 
-            elapsed = (
-                datetime.now(timezone.utc) - start_time
+        start_time = datetime.fromisoformat(started_at)
+
+        elapsed_seconds = (
+            now_utc - start_time
+        ).total_seconds()
+
+        monitoring_started = format_turkey_time(started_at)
+        detected_at = format_turkey_time(now_iso)
+        duration = format_duration(elapsed_seconds)
+
+        message = (
+            "✅ Instagram Account Is Active\n\n"
+            f"👻 Username: {username}\n"
+            "🟢 Status: Active\n"
+            f"⏱️ Time until activation: {duration}\n"
+            f"🕐 Monitoring started: {monitoring_started}\n"
+            f"🔍 Detected at: {detected_at}"
+        )
+
+        chat_id = context.application.bot_data.get("chat_id")
+
+        if chat_id:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=message
             )
 
-            total_seconds = int(elapsed.total_seconds())
+        cursor.execute(
+            """
+            UPDATE accounts
+            SET status = 'active',
+                notified = 1
+            WHERE username = ?
+            """,
+            (username,)
+        )
 
-            days = total_seconds // 86400
-            hours = (total_seconds % 86400) // 3600
-            minutes = (total_seconds % 3600) // 60
-
-            message = (
-                "🚨 Instagram Status Change Detected\n\n"
-                f"👻 Username: {username}\n"
-                "⛔ Status: Unavailable\n"
-                f"⏱️ Time monitored: "
-                f"{days} days, {hours} hours, {minutes} minutes\n"
-                f"🕐 Monitoring started: {started_at}\n"
-                f"🔍 Detected at: {now}"
-            )
-
-            # Bot sahibine mesaj gönder
-            chat_id = context.application.bot_data.get("chat_id")
-
-            if chat_id:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=message
-                )
-
-            cursor.execute(
-                """
-                UPDATE accounts
-                SET status = ?, notified = ?
-                WHERE username = ?
-                """,
-                (
-                    "unavailable",
-                    1,
-                    username
-                )
-            )
-
-            conn.commit()
+        conn.commit()
 
     conn.close()
 
@@ -270,17 +341,13 @@ async def save_chat_id(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-    """
-    Botun mesaj göndereceği Telegram chat ID'sini kaydeder.
-    """
-
     context.application.bot_data["chat_id"] = (
         update.effective_chat.id
     )
 
     await update.message.reply_text(
-        "✅ Chat ID saved. Automatic monitoring notifications "
-        "will be sent here."
+        "✅ Notification settings saved.\n"
+        "You will receive automatic activation alerts here."
     )
 
 
@@ -313,17 +380,21 @@ def main():
     )
 
     app.add_handler(
+        CommandHandler("stop", stop_account)
+    )
+
+    app.add_handler(
         CommandHandler("notify", save_chat_id)
     )
 
-    # Her 5 dakikada bir Instagram hesaplarını kontrol et
+    # Check monitored accounts every 5 minutes
     app.job_queue.run_repeating(
         monitor_accounts,
         interval=CHECK_INTERVAL,
         first=10
     )
 
-    print("Bot is running...")
+    print("ISMC Bot is running...")
 
     app.run_polling()
 
