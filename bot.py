@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import asyncio
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -13,10 +14,13 @@ from telegram.ext import (
 TOKEN = os.getenv("BOT_TOKEN")
 DB_FILE = "accounts.db"
 
-# Check every 5 minutes
+# Normal monitoring interval: 5 minutes
 CHECK_INTERVAL = 300
 
-# Turkey time (UTC+3)
+# Confirmation interval: 1 minute
+CONFIRMATION_INTERVAL = 60
+
+# Turkey time: UTC+3
 TURKEY_TZ = timezone(timedelta(hours=3))
 
 
@@ -46,7 +50,9 @@ def format_turkey_time(iso_time):
 
     dt = dt.astimezone(TURKEY_TZ)
 
-    return dt.strftime("%B %d, %Y at %I:%M %p").replace(" 0", " ")
+    return dt.strftime(
+        "%B %d, %Y at %I:%M %p"
+    ).replace(" 0", " ")
 
 
 def format_duration(seconds):
@@ -59,14 +65,20 @@ def format_duration(seconds):
     parts = []
 
     if days:
-        parts.append(f"{days} day" if days == 1 else f"{days} days")
+        parts.append(
+            f"{days} day" if days == 1 else f"{days} days"
+        )
 
     if hours:
-        parts.append(f"{hours} hour" if hours == 1 else f"{hours} hours")
+        parts.append(
+            f"{hours} hour" if hours == 1 else f"{hours} hours"
+        )
 
     if minutes:
         parts.append(
-            f"{minutes} minute" if minutes == 1 else f"{minutes} minutes"
+            f"{minutes} minute"
+            if minutes == 1
+            else f"{minutes} minutes"
         )
 
     if not parts:
@@ -76,7 +88,7 @@ def format_duration(seconds):
 
 
 def check_instagram(username):
-    clean_username = username.replace("@", "")
+    clean_username = username.replace("@", "").strip()
 
     url = f"https://www.instagram.com/{clean_username}/"
 
@@ -85,30 +97,238 @@ def check_instagram(username):
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0 Safari/537.36"
-        )
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
     }
 
     try:
         response = requests.get(
             url,
             headers=headers,
-            timeout=15,
+            timeout=20,
             allow_redirects=True
         )
 
+        # Only HTTP 200 counts as an active candidate.
         if response.status_code == 200:
-            return "active"
+            return True
 
-        if response.status_code in [404, 410]:
-            return "unavailable"
-
-        return "unknown"
+        return False
 
     except requests.RequestException:
-        return "unknown"
+        return False
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def update_last_checked(username, timestamp):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        UPDATE accounts
+        SET last_checked = ?
+        WHERE username = ?
+        """,
+        (timestamp, username)
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def get_monitored_accounts():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT username, started_at, notified
+        FROM accounts
+        WHERE status = 'monitoring'
+        """
+    )
+
+    accounts = cursor.fetchall()
+
+    conn.close()
+
+    return accounts
+
+
+def mark_active(username):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        UPDATE accounts
+        SET status = 'active',
+            notified = 1
+        WHERE username = ?
+        """,
+        (username,)
+    )
+
+    conn.commit()
+    conn.close()
+
+
+async def send_activation_notification(
+    context,
+    username,
+    started_at,
+    detected_at
+):
+    start_time = datetime.fromisoformat(
+        started_at
+    )
+
+    detected_time = datetime.fromisoformat(
+        detected_at
+    )
+
+    elapsed_seconds = (
+        detected_time - start_time
+    ).total_seconds()
+
+    duration = format_duration(
+        elapsed_seconds
+    )
+
+    message = (
+        "✅ Instagram Account Is Active\n\n"
+        f"👻 Username: {username}\n"
+        "🟢 Status: Active\n"
+        f"⏱️ Time until activation: {duration}\n"
+        f"🕐 Monitoring started: "
+        f"{format_turkey_time(started_at)}\n"
+        f"🔍 Detected at: "
+        f"{format_turkey_time(detected_at)}"
+    )
+
+    chat_id = context.application.bot_data.get(
+        "chat_id"
+    )
+
+    if chat_id:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=message
+        )
+
+        mark_active(username)
+
+
+async def confirm_activation(
+    context,
+    username,
+    started_at
+):
+    """
+    First HTTP 200 has been detected.
+
+    Check again after 1 minute.
+    If 200 again, check one more time after 1 minute.
+    Only after 3 consecutive HTTP 200 responses
+    is the account considered active.
+    """
+
+    # Confirmation #2
+    await asyncio.sleep(
+        CONFIRMATION_INTERVAL
+    )
+
+    result_2 = check_instagram(
+        username
+    )
+
+    now_2 = datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    update_last_checked(
+        username,
+        now_2
+    )
+
+    if not result_2:
+        return
+
+    # Confirmation #3
+    await asyncio.sleep(
+        CONFIRMATION_INTERVAL
+    )
+
+    result_3 = check_instagram(
+        username
+    )
+
+    now_3 = datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    update_last_checked(
+        username,
+        now_3
+    )
+
+    if not result_3:
+        return
+
+    # Three consecutive HTTP 200 responses.
+    await send_activation_notification(
+        context,
+        username,
+        started_at,
+        now_3
+    )
+
+
+async def monitor_accounts(
+    context: ContextTypes.DEFAULT_TYPE
+):
+    accounts = get_monitored_accounts()
+
+    for (
+        username,
+        started_at,
+        notified
+    ) in accounts:
+
+        if notified == 1:
+            continue
+
+        # Normal 5-minute check
+        result = check_instagram(
+            username
+        )
+
+        now = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+        update_last_checked(
+            username,
+            now
+        )
+
+        # If not HTTP 200, continue normal monitoring.
+        if not result:
+            continue
+
+        # First 200 detected.
+        # Start the 2-step, 1-minute confirmation.
+        await confirm_activation(
+            context,
+            username,
+            started_at
+        )
+
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
     await update.message.reply_text(
         "🤖 ISMC Bot is active!\n\n"
         "Start monitoring:\n"
@@ -116,11 +336,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Check status:\n"
         "/status @username\n\n"
         "Stop monitoring:\n"
-        "/stop @username"
+        "/stop @username\n\n"
+        "Set notification chat:\n"
+        "/notify"
     )
 
 
-async def add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def add_account(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
     if not context.args:
         await update.message.reply_text(
             "Usage: /add @username"
@@ -132,7 +357,9 @@ async def add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not username.startswith("@"):
         username = "@" + username
 
-    started_at = datetime.now(timezone.utc).isoformat()
+    started_at = datetime.now(
+        timezone.utc
+    ).isoformat()
 
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -140,7 +367,13 @@ async def add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.execute(
         """
         INSERT OR REPLACE INTO accounts
-        (username, started_at, status, last_checked, notified)
+        (
+            username,
+            started_at,
+            status,
+            last_checked,
+            notified
+        )
         VALUES (?, ?, ?, ?, ?)
         """,
         (
@@ -163,7 +396,10 @@ async def add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def status(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
     if not context.args:
         await update.message.reply_text(
             "Usage: /status @username"
@@ -180,7 +416,11 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cursor.execute(
         """
-        SELECT username, started_at, status, last_checked
+        SELECT
+            username,
+            started_at,
+            status,
+            last_checked
         FROM accounts
         WHERE username = ?
         """,
@@ -211,7 +451,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def stop_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stop_account(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
     if not context.args:
         await update.message.reply_text(
             "Usage: /stop @username"
@@ -251,92 +494,6 @@ async def stop_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def monitor_accounts(context: ContextTypes.DEFAULT_TYPE):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        SELECT username, started_at, status, notified
-        FROM accounts
-        WHERE status = 'monitoring'
-        """
-    )
-
-    accounts = cursor.fetchall()
-
-    for username, started_at, current_status, notified in accounts:
-
-        result = check_instagram(username)
-
-        now_utc = datetime.now(timezone.utc)
-        now_iso = now_utc.isoformat()
-
-        cursor.execute(
-            """
-            UPDATE accounts
-            SET last_checked = ?
-            WHERE username = ?
-            """,
-            (now_iso, username)
-        )
-
-        conn.commit()
-
-        # Do nothing if Instagram returns an uncertain result
-        if result == "unknown":
-            continue
-
-        # Wait until the account becomes active
-        if result != "active":
-            continue
-
-        # Do not send the notification more than once
-        if notified == 1:
-            continue
-
-        start_time = datetime.fromisoformat(started_at)
-
-        elapsed_seconds = (
-            now_utc - start_time
-        ).total_seconds()
-
-        monitoring_started = format_turkey_time(started_at)
-        detected_at = format_turkey_time(now_iso)
-        duration = format_duration(elapsed_seconds)
-
-        message = (
-            "✅ Instagram Account Is Active\n\n"
-            f"👻 Username: {username}\n"
-            "🟢 Status: Active\n"
-            f"⏱️ Time until activation: {duration}\n"
-            f"🕐 Monitoring started: {monitoring_started}\n"
-            f"🔍 Detected at: {detected_at}"
-        )
-
-        chat_id = context.application.bot_data.get("chat_id")
-
-        if chat_id:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=message
-            )
-
-        cursor.execute(
-            """
-            UPDATE accounts
-            SET status = 'active',
-                notified = 1
-            WHERE username = ?
-            """,
-            (username,)
-        )
-
-        conn.commit()
-
-    conn.close()
-
-
 async def save_chat_id(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
@@ -368,33 +525,50 @@ def main():
     )
 
     app.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start
+        )
     )
 
     app.add_handler(
-        CommandHandler("add", add_account)
+        CommandHandler(
+            "add",
+            add_account
+        )
     )
 
     app.add_handler(
-        CommandHandler("status", status)
+        CommandHandler(
+            "status",
+            status
+        )
     )
 
     app.add_handler(
-        CommandHandler("stop", stop_account)
+        CommandHandler(
+            "stop",
+            stop_account
+        )
     )
 
     app.add_handler(
-        CommandHandler("notify", save_chat_id)
+        CommandHandler(
+            "notify",
+            save_chat_id
+        )
     )
 
-    # Check monitored accounts every 5 minutes
+    # Normal monitoring every 5 minutes.
     app.job_queue.run_repeating(
         monitor_accounts,
         interval=CHECK_INTERVAL,
         first=10
     )
 
-    print("ISMC Bot is running...")
+    print(
+        "ISMC Bot is running..."
+    )
 
     app.run_polling()
 
